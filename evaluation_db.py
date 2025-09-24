@@ -426,3 +426,54 @@ if __name__ == "__main__":
             export_evaluations_to_html(sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5])
         else:
             print("Invalid command or arguments.")
+
+def get_subjects(
+    db_path: str,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """
+    Returnerer emner (Subject) som en liste med dicts:
+    [
+      {"id": "ECN170", "name": "Miljø- og ressursøkonomi", "evaluations": 6, "year_min": 2020, "year_max": 2025},
+      ...
+    ]
+    Støtter enkel søkestreng mot id og name, og limit.
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    base_sql = """
+        SELECT s.id,
+               COALESCE(s.name, '') AS name,
+               COUNT(DISTINCT e.id) AS evaluations,
+               MIN(e.year) AS year_min,
+               MAX(e.year) AS year_max
+        FROM Subject s
+        LEFT JOIN Evaluation e ON e.subject_id = s.id
+    """
+    where = ""
+    params: list = []
+    if search:
+        where = "WHERE s.id LIKE ? OR s.name LIKE ?"
+        like = f"%{search}%"
+        params.extend([like, like])
+
+    group_order = " GROUP BY s.id ORDER BY s.id"
+    if limit and isinstance(limit, int) and limit > 0:
+        group_order += f" LIMIT {int(limit)}"
+
+    sql = base_sql + (f" {where}" if where else "") + group_order
+    rows = cur.execute(sql, params).fetchall()
+    conn.close()
+
+    return [
+        {
+            "id": r[0],
+            "name": r[1],
+            "evaluations": int(r[2]) if r[2] is not None else 0,
+            "year_min": int(r[3]) if r[3] is not None else None,
+            "year_max": int(r[4]) if r[4] is not None else None,
+        }
+        for r in rows
+    ]
