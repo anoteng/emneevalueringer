@@ -56,20 +56,20 @@ class EvaluationRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html.encode('utf-8'))
             # /api/subjects[?q=ECN&limit=50]
-            if len(path_parts) >= 2 and path_parts[0] == 'api' and path_parts[1] == 'subjects':
-                query_params = urllib.parse.parse_qs(parsed.query)
-                search = query_params.get('q', [None])[0]
-                limit_str = query_params.get('limit', [None])[0]
-                limit = int(limit_str) if (limit_str and limit_str.isdigit()) else None
+        if len(path_parts) >= 2 and path_parts[0] == 'api' and path_parts[1] == 'subjects':
+            query_params = urllib.parse.parse_qs(parsed.query)
+            search = query_params.get('q', [None])[0]
+            limit_str = query_params.get('limit', [None])[0]
+            limit = int(limit_str) if (limit_str and limit_str.isdigit()) else None
 
-                subjects = evaluation_db.get_subjects(self.server.db_path, search=search, limit=limit)
-                payload = json.dumps({"items": subjects}, ensure_ascii=False)
+            subjects = evaluation_db.get_subjects(self.server.db_path, search=search, limit=limit)
+            payload = json.dumps({"items": subjects}, ensure_ascii=False)
 
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(payload.encode('utf-8'))
-                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(payload.encode('utf-8'))
+            return
 
         else:
             # Not found
