@@ -1,219 +1,217 @@
 """
-evaluation_api.py
-~~~~~~~~~~~~~~~~~~~
+evaluation_db.py
+~~~~~~~~~~~~~~~~~
 
-This module implements a simple HTTP API server for querying course evaluation
-data stored in a SQLite database.  The server exposes an endpoint at
-``/api/subject/<subject_id>`` which returns a table of evaluation results for
-the given subject across multiple years.  By default the response is an
-HTML document containing a rendered table.  The format can be changed via
-the query parameter ``format``: ``format=json`` returns JSON and
-``format=csv`` returns a CSV document.  The parameter ``include_stats``
-controls whether the statistics columns (number of responses, number of
-invitees and response percentage) are included; it accepts ``true`` or
-``false`` (case insensitive) and defaults to ``true``.  The ``questions``
-parameter accepts a comma‑separated list of question codes (e.g. ``1.1,1.2``)
-to limit the columns included in the result.
+This module implements a simple SQLite persistence layer for storing and
+querying course evaluation data.  It defines a schema of subjects,
+evaluations, questions, responses and summary statistics.  The central
+function exposed is :func:`get_subject_overview_df` which returns a
+``pandas.DataFrame`` summarising the results for a given subject across
+all years.
 
-This server depends on the companion module ``evaluation_db`` which
-implements the database schema and provides a high‑level API for querying
-evaluation data.  See that module for details on creating and populating
-the database.
+The schema is minimal and follows the conventions established during the
+conversation with the user.  If your database does not match this schema,
+you may need to adjust the queries accordingly.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-import logging
-import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+import sqlite3
+from typing import Iterable, Optional
 
 import pandas as pd
 
-try:
-    # evaluation_db provides get_subject_overview_df; import it lazily
-    from evaluation_db import get_subject_overview_df
-except Exception as exc:  # pragma: no cover - just informative logging
-    logging.getLogger(__name__).warning(
-        "Unable to import evaluation_db: %s. API will not function.", exc
-    )
 
+def get_subject_overview_df(
+    db_path: str,
+    subject_code: str,
+    include_stats: bool = True,
+    columns: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
+    """Return a DataFrame summarising evaluations for the given subject.
 
-def _parse_bool(value: str, default: bool) -> bool:
-    """Return a boolean from a string, with a default when empty.
+    Parameters
+    ----------
+    db_path: str
+        Path to the SQLite database file.
+    subject_code: str
+        The code of the subject to retrieve (e.g. ``"AOS120"``).
+    include_stats: bool, optional
+        Whether to include the summary statistics columns (``Antall svar``,
+        ``Antall invitert`` and ``Svar%``).  Defaults to ``True``.
+    columns: Iterable[str], optional
+        An optional list of question identifiers (e.g. ``["1.1", "1.2"]``).
+        If provided, only these questions will be included in the result.  The
+        identifiers are matched by prefix against the ``Question.id`` column.
 
-    Accepts typical truthy and falsy values (true/false, yes/no, 1/0).
-    Any other value results in the default being returned.
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame where each row corresponds to a year and each column
+        corresponds to a question (with its label) or a statistics field.
     """
-    if value is None:
-        return default
-    value_lower = value.lower()
-    if value_lower in {"true", "t", "yes", "y", "1"}:
-        return True
-    if value_lower in {"false", "f", "no", "n", "0"}:
-        return False
-    return default
-
-
-class EvaluationRequestHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the evaluation API."""
-
-    def _set_headers(self, status: int, content_type: str) -> None:
-        """Send a response status and headers."""
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.end_headers()
-
-    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-        """Handle a GET request."""
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path
-        query_params = parse_qs(parsed_url.query)
-
-        # Only handle /api/subject/<subject_id>
-        if path.startswith("/api/subject/"):
-            parts = path.strip("/").split("/")
-            # Expect at least two segments: ['api', 'subject', '<id>']
-            if len(parts) >= 3:
-                subject_id = parts[2]
-                include_stats = _parse_bool(
-                    query_params.get("include_stats", [None])[0], True
-                )
-                # Extract questions parameter; default to None
-                questions_param = query_params.get("questions", [None])[0]
-                questions: list[str] | None
-                if questions_param:
-                    questions = [q.strip() for q in questions_param.split(",") if q.strip()]
-                else:
-                    questions = None
-                # Determine response format
-                fmt = query_params.get("format", ["html"])[0].lower()
-
-                # Query the database for the subject overview
-                try:
-                    df = get_subject_overview_df(
-                        self.server.db_path, subject_id, include_stats=include_stats
-                    )
-                except Exception as exc:
-                    logging.getLogger(__name__).exception(
-                        "Error retrieving data for %s: %s", subject_id, exc
-                    )
-                    self._set_headers(500, "text/plain; charset=utf-8")
-                    self.wfile.write(
-                        f"Error retrieving data for {subject_id}: {exc}".encode("utf-8")
-                    )
-                    return
-
-                # Limit to selected questions if provided
-                if questions:
-                    # Build list of columns to keep: 'År' plus each question label
-                    cols_to_keep: list[str] = [col for col in df.columns if col == "År"]
-                    for q in questions:
-                        # Each question may be labelled like '1.1 Forventninger'; match by prefix
-                        matches = [c for c in df.columns if c.startswith(q + " ") or c == q]
-                        cols_to_keep.extend(matches)
-                    if include_stats:
-                        cols_to_keep.extend(
-                            [c for c in ["Antall svar", "Antall invitert", "Svar%"] if c in df.columns]
-                        )
-                    # Filter the DataFrame
-                    df = df[cols_to_keep]
-
-                # Sort years ascending for older to newer (the DB returns ascending order by default)
-
-                # Dispatch based on format
-                if fmt == "json":
-                    # Convert DataFrame to JSON
-                    result_json = df.to_dict(orient="records")
-                    self._set_headers(200, "application/json; charset=utf-8")
-                    self.wfile.write(json.dumps(result_json, ensure_ascii=False).encode("utf-8"))
-                    return
-                elif fmt == "csv":
-                    # Convert DataFrame to CSV
-                    csv_data = df.to_csv(index=False, sep=",", line_terminator="\n")
-                    self._set_headers(
-                        200,
-                        "text/csv; charset=utf-8",
-                    )
-                    self.wfile.write(csv_data.encode("utf-8"))
-                    return
-                else:
-                    # Default to HTML output
-                    html = df.to_html(index=False, escape=False, classes="dataframe")
-                    # Build a simple HTML page around the table
-                    page = f"""<!DOCTYPE html>
-<html lang='en'>
-<head>
-  <meta charset='utf-8'>
-  <title>Evaluations for {subject_id}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 2em; }}
-    table.dataframe {{ border-collapse: collapse; width: 100%; }}
-    table.dataframe th, table.dataframe td {{ border: 1px solid #ddd; padding: 8px; }}
-    table.dataframe th {{ background-color: #f2f2f2; }}
-  </style>
-</head>
-<body>
-  <h2>Evaluations for {subject_id}</h2>
-  {html}
-</body>
-</html>"""
-                    self._set_headers(200, "text/html; charset=utf-8")
-                    self.wfile.write(page.encode("utf-8"))
-                    return
-        # If path doesn't match, return 404
-        self._set_headers(404, "text/plain; charset=utf-8")
-        self.wfile.write(b"Not Found")
-
-
-def run_server(db_path: str, host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Start the HTTP server with the given database path, host and port."""
-    server_address = (host, port)
-    # Bind the db_path to the server instance for use in the handler
-    class _EvaluationServer(HTTPServer):
-        def __init__(self, server_address, RequestHandlerClass):
-            super().__init__(server_address, RequestHandlerClass)
-            self.db_path = db_path
-
-    httpd = _EvaluationServer(server_address, EvaluationRequestHandler)
-    logging.info("Starting evaluation API server at http://%s:%s", host, port)
+    conn = sqlite3.connect(db_path)
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        # Determine how evaluations reference subjects.  Newer schemas use
+        # ``subject_code`` on the Evaluation table, but some legacy schemas
+        # instead store the code in a column named ``subject`` or reference
+        # the subject table via a foreign key ``subject_id``.  Inspect the
+        # Evaluation table to choose the appropriate filter.
+        c = conn.cursor()
+        c.execute("PRAGMA table_info(Evaluation)")
+        eval_cols = [row[1] for row in c.fetchall()]
+        # Default: expect a ``subject_code`` column
+        eval_subject_col: Optional[str] = None
+        join_subject = False
+        if "subject_code" in eval_cols:
+            eval_subject_col = "subject_code"
+        elif "subject" in eval_cols:
+            eval_subject_col = "subject"
+        elif "subject_id" in eval_cols:
+            # We'll need to join Subject on id
+            eval_subject_col = "subject_id"
+            join_subject = True
+
+        # Build the query for evaluation results based on detected schema
+        if eval_subject_col is None:
+            raise sqlite3.OperationalError(
+                "Evaluation table does not contain a subject reference column"
+            )
+
+        if not join_subject:
+            # Simple filter on Evaluation table
+            query = f"""
+                SELECT
+                    e.year AS year,
+                    q.id AS question_id,
+                    q.label AS question_label,
+                    er.value AS value
+                FROM EvaluationResult er
+                JOIN Evaluation e ON e.id = er.evaluation_id
+                JOIN Question q ON q.id = er.question_id
+                WHERE e.{eval_subject_col} = ?
+            """
+            params = (subject_code,)
+        else:
+            # Join to Subject via subject_id and filter by subject.code
+            query = f"""
+                SELECT
+                    e.year AS year,
+                    q.id AS question_id,
+                    q.label AS question_label,
+                    er.value AS value
+                FROM EvaluationResult er
+                JOIN Evaluation e ON e.id = er.evaluation_id
+                JOIN Question q ON q.id = er.question_id
+                JOIN Subject s ON e.{eval_subject_col} = s.id
+                WHERE s.id = ?
+            """
+            params = (subject_code,)
+
+        df = pd.read_sql_query(query, conn, params=params)
+        if df.empty:
+            return pd.DataFrame()
+
+        df["question"] = df["question_id"].astype(str) + " " + df["question_label"].astype(str)
+        if columns is not None:
+            cols = set(columns)
+            df = df[df["question_id"].apply(lambda qid: any(qid.startswith(c) for c in cols))]
+        table = df.pivot_table(
+            index="year",
+            columns="question",
+            values="value",
+            aggfunc="first",
+        )
+        table = table.reset_index().rename(columns={"year": "År"})
+
+        # Append statistics if requested.  The schema of EvaluationStats varies between
+        # installations; it may use columns like ``num_responses`` and ``num_invited``
+        # or ``answered`` and ``invited`` and may include a precomputed
+        # ``response_percent``.  Introspect the EvaluationStats table to determine
+        # which column names to use.
+        if include_stats:
+            # Determine column names for responses and invited in EvaluationStats
+            c.execute("PRAGMA table_info(EvaluationStats)")
+            stat_cols = [row[1] for row in c.fetchall()]
+            # Default names used in earlier schema
+            resp_col = None
+            invited_col = None
+            percent_col = None
+            # Identify columns: prefer numeric counts if available
+            for name in stat_cols:
+                lname = name.lower()
+                if lname in {"num_responses", "responses", "answered"}:
+                    resp_col = name
+                elif lname in {"num_invited", "invited"}:
+                    invited_col = name
+                elif lname in {"response_percent", "response_percentage", "percent", "percent_response"}:
+                    percent_col = name
+            # Build base SELECT clause for stats query
+            select_parts = ["e.year AS year"]
+            if resp_col:
+                select_parts.append(f"es.{resp_col} AS responses")
+            if invited_col:
+                select_parts.append(f"es.{invited_col} AS invited")
+            if percent_col:
+                select_parts.append(f"es.{percent_col} AS response_percent")
+            # Construct the SQL query dynamically
+            select_clause = ",\n                    ".join(select_parts)
+            if not join_subject:
+                stats_query = f"""
+                    SELECT
+                        {select_clause}
+                    FROM EvaluationStats es
+                    JOIN Evaluation e ON e.id = es.evaluation_id
+                    WHERE e.{eval_subject_col} = ?
+                """
+                stats_params = (subject_code,)
+            else:
+                stats_query = f"""
+                    SELECT
+                        {select_clause}
+                    FROM EvaluationStats es
+                    JOIN Evaluation e ON e.id = es.evaluation_id
+                    JOIN Subject s ON e.{eval_subject_col} = s.id
+                    WHERE s.id = ?
+                """
+                stats_params = (subject_code,)
+            stats = pd.read_sql_query(stats_query, conn, params=stats_params)
+            if not stats.empty:
+                # If multiple evaluations exist per year, aggregate numeric counts
+                if "responses" in stats.columns or "invited" in stats.columns:
+                    numeric_cols = []
+                    if "responses" in stats.columns:
+                        numeric_cols.append("responses")
+                    if "invited" in stats.columns:
+                        numeric_cols.append("invited")
+                    # Sum numeric counts by year
+                    stats_grouped = stats.groupby("year")[numeric_cols].sum().reset_index()
+                else:
+                    stats_grouped = stats.drop_duplicates(subset=["year"]).copy()
+
+                # Compute percentages if possible
+                stats_grouped.rename(columns={"year": "År"}, inplace=True)
+                if "responses" in stats_grouped.columns and "invited" in stats_grouped.columns:
+                    stats_grouped.rename(
+                        columns={"responses": "Antall svar", "invited": "Antall invitert"},
+                        inplace=True,
+                    )
+                    stats_grouped["Svar%"] = stats_grouped.apply(
+                        lambda row: f"{round((row['Antall svar'] / row['Antall invitert'] * 100))} %"
+                        if row["Antall invitert"] else "",
+                        axis=1,
+                    )
+                elif percent_col and "response_percent" in stats.columns:
+                    # Use the existing response_percent column directly
+                    stats_grouped.rename(columns={"response_percent": "Svar%"}, inplace=True)
+                # Merge into the table by year
+                table = table.merge(stats_grouped, on="År", how="left")
+
+        table.sort_values(by="År", ascending=True, inplace=True)
+        cols = list(table.columns)
+        if "År" in cols:
+            cols.insert(0, cols.pop(cols.index("År")))
+        table = table[cols]
+        return table
     finally:
-        httpd.server_close()
-        logging.info("Evaluation API server stopped.")
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Parse command line arguments and start the server."""
-    parser = argparse.ArgumentParser(description="Run the evaluation API server.")
-    parser.add_argument(
-        "--db",
-        dest="db_path",
-        required=True,
-        help="Path to the SQLite database.",
-    )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Host address to listen on (default: 127.0.0.1).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to listen on (default: 8000).",
-    )
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    run_server(args.db_path, args.host, args.port)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        conn.close()
