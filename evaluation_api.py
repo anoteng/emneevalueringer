@@ -33,8 +33,8 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 try:
-    # evaluation_db provides get_subject_overview_df; import it lazily
-    from evaluation_db import get_subject_overview_df
+    # evaluation_db provides functions for querying the database; import lazily
+from evaluation_db import get_subject_overview_df, get_subjects_df, get_subjects
 except Exception as exc:  # pragma: no cover - just informative logging
     logging.getLogger(__name__).warning(
         "Unable to import evaluation_db: %s. API will not function.", exc
@@ -72,7 +72,71 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         query_params = parse_qs(parsed_url.query)
 
-        # Only handle /api/subject/<subject_id>
+        # Handle listing all subjects.  This endpoint supports optional
+        # search (``q``) and limit (``limit``) parameters to filter and
+        # limit results.  The default response format is JSON to mirror
+        # the behaviour in commit 57e7293163fa60c343cc733a9d1b228ac5baa5d9.
+        # ``format`` can be ``json`` (default), ``csv`` or ``html``.
+        if path in {"/api/subject", "/api/subject/", "/api/subjects"}:
+            fmt = query_params.get("format", ["json"])[0].lower()
+            search = query_params.get("q", [None])[0]
+            limit_param = query_params.get("limit", [None])[0]
+            limit: int | None = None
+            if limit_param:
+                try:
+                    limit = int(limit_param)
+                except Exception:
+                    limit = None
+            try:
+                subjects = get_subjects(
+                    self.server.db_path,
+                    search=search,
+                    limit=limit,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).exception(
+                    "Error retrieving subject list: %s", exc
+                )
+                self._set_headers(500, "text/plain; charset=utf-8")
+                self.wfile.write(f"Error retrieving subject list: {exc}".encode("utf-8"))
+                return
+            # JSON format (default) returns a dictionary with "items"
+            if fmt == "json":
+                payload = json.dumps({"items": subjects}, ensure_ascii=False)
+                self._set_headers(200, "application/json; charset=utf-8")
+                self.wfile.write(payload.encode("utf-8"))
+                return
+            # CSV and HTML convert the list of dicts into a DataFrame first
+            df = pd.DataFrame(subjects)
+            if fmt == "csv":
+                csv_data = df.to_csv(index=False, sep=",", lineterminator="\n")
+                self._set_headers(200, "text/csv; charset=utf-8")
+                self.wfile.write(csv_data.encode("utf-8"))
+                return
+            else:  # html
+                html = df.to_html(index=False, escape=False, classes="dataframe")
+                page = f"""<!DOCTYPE html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8'>
+  <title>Subject List</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 2em; }}
+    table.dataframe {{ border-collapse: collapse; width: 100%; }}
+    table.dataframe th, table.dataframe td {{ border: 1px solid #ddd; padding: 8px; }}
+    table.dataframe th {{ background-color: #f2f2f2; }}
+  </style>
+</head>
+<body>
+  <h2>Subject List</h2>
+  {html}
+</body>
+</html>"""
+                self._set_headers(200, "text/html; charset=utf-8")
+                self.wfile.write(page.encode("utf-8"))
+                return
+
+        # Handle /api/subject/<subject_id>
         if path.startswith("/api/subject/"):
             parts = path.strip("/").split("/")
             # Expect at least two segments: ['api', 'subject', '<id>']
@@ -81,17 +145,13 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                 include_stats = _parse_bool(
                     query_params.get("include_stats", [None])[0], True
                 )
-                # Extract questions parameter; default to None
                 questions_param = query_params.get("questions", [None])[0]
                 questions: list[str] | None
                 if questions_param:
                     questions = [q.strip() for q in questions_param.split(",") if q.strip()]
                 else:
                     questions = None
-                # Determine response format
                 fmt = query_params.get("format", ["html"])[0].lower()
-
-                # Query the database for the subject overview
                 try:
                     df = get_subject_overview_df(
                         self.server.db_path, subject_id, include_stats=include_stats
@@ -105,33 +165,23 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                         f"Error retrieving data for {subject_id}: {exc}".encode("utf-8")
                     )
                     return
-
                 # Limit to selected questions if provided
                 if questions:
-                    # Build list of columns to keep: 'År' plus each question label
                     cols_to_keep: list[str] = [col for col in df.columns if col == "År"]
                     for q in questions:
-                        # Each question may be labelled like '1.1 Forventninger'; match by prefix
                         matches = [c for c in df.columns if c.startswith(q + " ") or c == q]
                         cols_to_keep.extend(matches)
                     if include_stats:
                         cols_to_keep.extend(
                             [c for c in ["Antall svar", "Antall invitert", "Svar%"] if c in df.columns]
                         )
-                    # Filter the DataFrame
                     df = df[cols_to_keep]
-
-                # Sort years ascending for older to newer (the DB returns ascending order by default)
-
-                # Dispatch based on format
                 if fmt == "json":
-                    # Convert DataFrame to JSON
                     result_json = df.to_dict(orient="records")
                     self._set_headers(200, "application/json; charset=utf-8")
                     self.wfile.write(json.dumps(result_json, ensure_ascii=False).encode("utf-8"))
                     return
                 elif fmt == "csv":
-                    # Convert DataFrame to CSV
                     csv_data = df.to_csv(index=False, sep=",", lineterminator="\n")
                     self._set_headers(
                         200,
@@ -140,9 +190,7 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(csv_data.encode("utf-8"))
                     return
                 else:
-                    # Default to HTML output
                     html = df.to_html(index=False, escape=False, classes="dataframe")
-                    # Build a simple HTML page around the table
                     page = f"""<!DOCTYPE html>
 <html lang='en'>
 <head>

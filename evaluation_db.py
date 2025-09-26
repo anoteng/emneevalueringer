@@ -215,3 +215,134 @@ def get_subject_overview_df(
         return table
     finally:
         conn.close()
+
+
+def get_subjects_df(db_path: str) -> pd.DataFrame:
+    """Return a DataFrame listing all subjects in the database.
+
+    Each row contains two columns: ``id`` (the subject code) and ``name``
+    (the descriptive name).  The result is sorted by subject code.
+
+    Parameters
+    ----------
+    db_path: str
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame with columns ``id`` and ``name``.  If there are no
+        subjects, returns an empty DataFrame.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query(
+            "SELECT id, name FROM Subject ORDER BY id", conn
+        )
+        return df
+    finally:
+        conn.close()
+
+# New function mirroring the subject list API from the 57e7293163fa60c343cc733a9d1b228ac5baa5d9
+# commit.  This returns a list of dictionaries where each dictionary
+# contains the subject code (``id``), optional name (``name``), the
+# number of evaluations recorded for the subject (``evaluations``) and
+# the range of years covered by those evaluations (``year_min`` and
+# ``year_max``).  A simple search string can be provided to filter on
+# subject code or name, and the number of returned records can be
+# limited via ``limit``.  The implementation automatically adapts to
+# variations in the schema: the ``Evaluation`` table may reference
+# subjects via a ``subject_code``, ``subject`` or ``subject_id``
+# column.  Missing years or evaluation counts are represented as
+# ``None``.
+
+def get_subjects(
+    db_path: str,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Return a list of subjects with evaluation counts and year range.
+
+    Parameters
+    ----------
+    db_path: str
+        Path to the SQLite database file.
+    search: str, optional
+        A search string used to filter subjects.  If provided, it
+        matches case‑insensitively against both the subject code and
+        subject name.  When ``None`` no filtering is applied.
+    limit: int, optional
+        The maximum number of subjects to return.  If ``None`` or
+        non‑positive, all matching subjects are returned.
+
+    Returns
+    -------
+    list of dict
+        A list of dictionaries, each with keys ``id``, ``name``,
+        ``evaluations``, ``year_min`` and ``year_max``.  The
+        ``evaluations`` key holds the number of distinct evaluation
+        records for the subject; ``year_min`` and ``year_max``
+        represent the minimum and maximum year found in the
+        ``Evaluation`` table for that subject.  If there are no
+        evaluations the numeric fields will be ``0`` or ``None``.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        c = conn.cursor()
+        # Inspect the Evaluation table to determine how subjects are referenced.
+        c.execute("PRAGMA table_info(Evaluation)")
+        eval_cols = [row[1] for row in c.fetchall()]
+        subject_col: Optional[str] = None
+        # In new schemas the evaluation table stores the subject code directly
+        if "subject_code" in eval_cols:
+            subject_col = "subject_code"
+        # Some older schemas use a column named ``subject``
+        elif "subject" in eval_cols:
+            subject_col = "subject"
+        # Legacy schemas use ``subject_id`` with a foreign key to Subject.id
+        elif "subject_id" in eval_cols:
+            subject_col = "subject_id"
+        else:
+            raise sqlite3.OperationalError(
+                "Evaluation table does not contain a subject reference column"
+            )
+
+        # Build the base SQL.  We always join Subject to Evaluation via the
+        # detected subject column.  The COALESCE ensures name is a string.
+        base_sql = f"""
+            SELECT s.id,
+                   COALESCE(s.name, '') AS name,
+                   COUNT(DISTINCT e.id) AS evaluations,
+                   MIN(e.year) AS year_min,
+                   MAX(e.year) AS year_max
+            FROM Subject s
+            LEFT JOIN Evaluation e ON e.{subject_col} = s.id
+        """
+        where_clauses: list[str] = []
+        params: list = []
+        if search:
+            # Use wildcard matching on both id and name
+            where_clauses.append("(s.id LIKE ? OR s.name LIKE ?)")
+            like = f"%{search}%"
+            params.extend([like, like])
+        sql = base_sql
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        sql += " GROUP BY s.id ORDER BY s.id"
+        if limit and isinstance(limit, int) and limit > 0:
+            sql += f" LIMIT {int(limit)}"
+        rows = c.execute(sql, params).fetchall()
+        result: list[dict] = []
+        for r in rows:
+            result.append(
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "evaluations": int(r[2]) if r[2] is not None else 0,
+                    "year_min": int(r[3]) if r[3] is not None else None,
+                    "year_max": int(r[4]) if r[4] is not None else None,
+                }
+            )
+        return result
+    finally:
+        conn.close()
