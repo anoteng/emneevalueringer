@@ -34,7 +34,7 @@ import pandas as pd
 
 try:
     # evaluation_db provides functions for querying the database; import lazily
-from evaluation_db import get_subject_overview_df, get_subjects_df, get_subjects
+    from evaluation_db import get_subject_overview_df, get_subjects_df, get_subjects
 except Exception as exc:  # pragma: no cover - just informative logging
     logging.getLogger(__name__).warning(
         "Unable to import evaluation_db: %s. API will not function.", exc
