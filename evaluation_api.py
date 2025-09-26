@@ -132,7 +132,7 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                     return
                 elif fmt == "csv":
                     # Convert DataFrame to CSV
-                    csv_data = df.to_csv(index=False, sep=",", line_terminator="\n")
+                    csv_data = df.to_csv(index=False, sep=",", lineterminator="\n")
                     self._set_headers(
                         200,
                         "text/csv; charset=utf-8",
