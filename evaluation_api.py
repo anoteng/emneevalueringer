@@ -110,7 +110,11 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
             df = pd.DataFrame(subjects)
             if fmt == "csv":
                 csv_data = df.to_csv(index=False, sep=";", lineterminator="\n", decimal=',')
-                self._set_headers(200, "text/csv; charset=utf-8", extra_headers={'Content-Language': 'nb-NO'})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Language",
+                                 "nb-NO")
+                self.end_headers()
                 self.wfile.write(csv_data.encode("utf-8"))
                 return
             else:  # html
