@@ -182,10 +182,11 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps(result_json, ensure_ascii=False).encode("utf-8"))
                     return
                 elif fmt == "csv":
-                    csv_data = df.to_csv(index=False, sep=",", lineterminator="\n")
+                    csv_data = df.to_csv(index=False, sep=";", lineterminator="\n", decimal=",")
                     self._set_headers(
                         200,
                         "text/csv; charset=utf-8",
+                        extra_headers={'Content-Language': 'nb-NO'}
                     )
                     self.wfile.write(csv_data.encode("utf-8"))
                     return
