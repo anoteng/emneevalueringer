@@ -243,8 +243,7 @@ def get_subjects_df(db_path: str) -> pd.DataFrame:
     finally:
         conn.close()
 
-# New function mirroring the subject list API from the 57e7293163fa60c343cc733a9d1b228ac5baa5d9
-# commit.  This returns a list of dictionaries where each dictionary
+# This returns a list of dictionaries where each dictionary
 # contains the subject code (``id``), optional name (``name``), the
 # number of evaluations recorded for the subject (``evaluations``) and
 # the range of years covered by those evaluations (``year_min`` and

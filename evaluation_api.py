@@ -109,8 +109,8 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
             # CSV and HTML convert the list of dicts into a DataFrame first
             df = pd.DataFrame(subjects)
             if fmt == "csv":
-                csv_data = df.to_csv(index=False, sep=",", lineterminator="\n")
-                self._set_headers(200, "text/csv; charset=utf-8")
+                csv_data = df.to_csv(index=False, sep=";", lineterminator="\n", decimal=',')
+                self._set_headers(200, "text/csv; charset=utf-8", extra_headers={'Content-Language': 'nb-NO'})
                 self.wfile.write(csv_data.encode("utf-8"))
                 return
             else:  # html
