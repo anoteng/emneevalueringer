@@ -68,96 +68,105 @@ def get_subject_overview_df(
     columns: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """
-    Returner en DataFrame med evalueringer for gitt emnekode.
+    Hent oversikt for ett emne fra MariaDB.
 
-    Kolonner:
-      - "År"
-      - én kolonne per spørsmål: "<id> <label>", f.eks. "1.1 Faglig innhold"
-      - hvis include_stats=True: "Antall svar", "Antall invitert", "Svar%"
+    Returnerer en DataFrame med én rad per år, kolonner for hvert spørsmål
+    (f.eks. "1.1 Læringsutbytte") + ev. statistikk-kolonner.
     """
     conn = _get_connection(db_path)
     try:
-        # Alle enkeltresultater for emnet
+        # 1) Hent alle svar for emnet
+        # Juster evt. navn på spørsmåltabellen:
+        #  - hvis du har "course_eval_question" med (id,label) -> bruk den
+        #  - hvis du fortsatt har "Question" -> bytt LEFT JOIN-linjen under
         sql = """
             SELECT
-                e.year AS year,
-                q.id   AS question_id,
-                q.label AS question_label,
-                r.value AS value
-            FROM course_eval_result AS r
-            JOIN course_eval AS e
+                e.year              AS year,
+                r.question_id       AS question_id,
+                COALESCE(q.label, r.question_id) AS question_label,
+                r.value             AS value
+            FROM course_eval_result r
+            JOIN course_eval e
               ON e.id = r.evaluation_id
-            JOIN course_eval_question AS q
+            LEFT JOIN course_eval_question q
               ON q.id = r.question_id
             WHERE e.subject_id = %s
         """
         df = pd.read_sql(sql, conn, params=[subject_code])
+
         if df.empty:
             return pd.DataFrame()
 
-        # Kolonnenavn i stil med "1.1 Spørsmålslabel"
+        # 2) Lag "spørsmålsnavn" = "1.1 Læringsutbytte"
         df["question"] = df["question_id"].astype(str) + " " + df["question_label"].astype(str)
 
-        # Filtrer på ønskede spørsmål (prefiks på question_id) hvis oppgitt
+        # 3) Filtrer på spørsmål hvis columns er gitt (samme semantikk som før)
         if columns is not None:
-            prefixes = set(columns)
-            df = df[df["question_id"].apply(lambda qid: any(qid.startswith(p) for p in prefixes))]
+            wanted = set(columns)
+            df = df[df["question_id"].apply(lambda qid: any(str(qid).startswith(c) for c in wanted))]
 
-        # Pivot: én rad per år, én kolonne per spørsmål
+        if df.empty:
+            return pd.DataFrame()
+
+        # 4) Pivot: rader = år, kolonner = spørsmål
         table = df.pivot_table(
             index="year",
             columns="question",
             values="value",
-            aggfunc="first",
+            aggfunc="mean",
         )
-        table = table.reset_index().rename(columns={"year": "År"})
 
+        # 5) Flytt år til egen kolonne
+        table.reset_index(inplace=True)
+        table.rename(columns={"year": "År"}, inplace=True)
+
+        # 6) Hent statistikk hvis ønsket
         if include_stats:
             stats_sql = """
                 SELECT
-                    e.year AS year,
-                    SUM(s.answered) AS answered,
-                    SUM(s.invited) AS invited
-                FROM course_eval_stats AS s
-                JOIN course_eval AS e
+                    e.year              AS year,
+                    s.answered          AS answered,
+                    s.invited           AS invited,
+                    s.response_percent  AS response_percent
+                FROM course_eval_stats s
+                JOIN course_eval e
                   ON e.id = s.evaluation_id
                 WHERE e.subject_id = %s
-                GROUP BY e.year
             """
             stats = pd.read_sql(stats_sql, conn, params=[subject_code])
-            if not stats.empty:
-                # Beregn svarprosent
-                def _calc_pct(row):
-                    invited = row["invited"]
-                    answered = row["answered"]
-                    if invited in (0, None):
-                        return None
-                    try:
-                        return float(answered) / invited * 100
-                    except Exception:
-                        return None
 
-                stats["Svar%"] = stats.apply(_calc_pct, axis=1)
-                stats = stats.rename(
+            if not stats.empty:
+                # Dersom flere eval per år: summer svar/inviterte, ta f.eks. høyeste response_percent
+                stats_grouped = (
+                    stats.groupby("year", as_index=False)
+                         .agg(
+                             answered=("answered", "sum"),
+                             invited=("invited", "sum"),
+                             response_percent=("response_percent", "max"),
+                         )
+                )
+                table = table.merge(stats_grouped, left_on="År", right_on="year", how="left")
+                table.drop(columns=["year"], inplace=True, errors="ignore")
+                table.rename(
                     columns={
-                        "year": "År",
                         "answered": "Antall svar",
                         "invited": "Antall invitert",
-                    }
+                        "response_percent": "Svar%",
+                    },
+                    inplace=True,
                 )
-                table = table.merge(stats, on="År", how="left")
 
-        # Ryddig kolonnerekkefølge: År først, så spørsmål, stats til slutt
-        cols = list(table.columns)
-        base_cols = ["År"]
-        stat_cols = [c for c in ["Antall svar", "Antall invitert", "Svar%"] if c in cols]
-        question_cols = [c for c in cols if c not in base_cols + stat_cols]
-        ordered = base_cols + sorted(question_cols) + stat_cols
-        table = table[ordered]
+        # 7) Rydd kolonnerekkefølge og sorter
+        if "År" in table.columns:
+            other_cols = [c for c in table.columns if c != "År"]
+            table = table[["År"] + other_cols]
+            table.sort_values(by="År", inplace=True)
 
         return table
+
     finally:
         conn.close()
+
 
 
 def get_subjects_df(db_path: str) -> pd.DataFrame:
