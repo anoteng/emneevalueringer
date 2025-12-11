@@ -181,10 +181,16 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                         )
                     df = df[cols_to_keep]
                 if fmt == "json":
-                    result_json = df.to_dict(orient="records")
+                    # Bytt ut NaN/NaT med None → JSON får null i stedet for NaN
+                    df_safe = df.where(pd.notnull(df), None)
+
+                    result_json = df_safe.to_dict(orient="records")
+                    payload = json.dumps(result_json, ensure_ascii=False)
+
                     self._set_headers(200, "application/json; charset=utf-8")
-                    self.wfile.write(json.dumps(result_json, ensure_ascii=False).encode("utf-8"))
+                    self.wfile.write(payload.encode("utf-8"))
                     return
+
                 elif fmt == "csv":
                     csv_data = df.to_csv(index=False, sep=";", lineterminator="\n", decimal=",")
                     self.send_response(200)
