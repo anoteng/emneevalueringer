@@ -46,7 +46,10 @@ def _get_engine(db_name: str):
     user = os.environ.get("EVAL_DB_USER", "aol")
     password = os.environ.get("EVAL_DB_PASSWORD", "")
 
-    # NB: password uten quoting – sørg for at env-variabelen er satt riktig
+    # Escape brukernavn og passord for URL
+    user = quote_plus(user)
+    password = quote_plus(password)
+
     url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}"
     engine = create_engine(
         url,
