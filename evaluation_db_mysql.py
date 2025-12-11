@@ -395,15 +395,28 @@ def import_pasted_evaluations(
     # Spørsmålskolonner: alt mellom Emne og Antall svar
     question_cols = header[1:idx_answered]
     question_defs: list[tuple[str, str]] = []  # (code, label)
+
     for col in question_cols:
         if not col:
             continue
-        parts = col.split(None, 1)
-        if not parts:
+        raw = col.strip()
+
+        # Først prøver vi varianten "1 - Veileders tilgjengelighet"
+        num_part, sep, rest = raw.partition("-")
+        if sep:  # vi fant en bindestrek
+            code = num_part.strip().rstrip(".")  # "1" eller "1."
+            label = rest.strip()  # "Veileders tilgjengelighet"
+        else:
+            # Fallback: "1.1 Forventninger"
+            parts = raw.split(None, 1)
+            if not parts:
+                continue
+            code = parts[0].rstrip(".")
+            label = parts[1].strip() if len(parts) > 1 else ""
+
+        if not code:
             continue
-        raw_code = parts[0]
-        label = parts[1] if len(parts) > 1 else ""
-        code = raw_code.rstrip(".")  # '2.' -> '2'
+
         question_defs.append((code, label))
 
     # Parse datalinjer
