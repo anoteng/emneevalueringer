@@ -24,7 +24,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 import pymysql
-
+from sqlalchemy import create_engine
 
 # ---------------------------------------------------------------------------
 # DB-tilkobling
@@ -46,15 +46,24 @@ def _get_connection(db_name: str):
     user = os.environ.get("EVAL_DB_USER", "aol")
     password = os.environ.get("EVAL_DB_PASSWORD", "")
 
-    return pymysql.connect(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=db_name,
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
+
+    engine = create_engine(
+        f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}",
+        pool_recycle=3600,
+        pool_pre_ping=True,
     )
+
+    return engine
+
+    # return pymysql.connect(
+    #     host=host,
+    #     port=port,
+    #     user=user,
+    #     password=password,
+    #     database=db_name,
+    #     charset="utf8mb4",
+    #     cursorclass=pymysql.cursors.DictCursor,
+    # )
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +211,9 @@ def get_subject_overview_df(
               ON e.semester_id = s.id
             WHERE e.course_id = %s
         """
-        df = pd.read_sql(sql, conn, params=[course_id])
+
+
+        df = pd.read_sql(sql, engine, params=[course_id])
 
         if df.empty:
             return pd.DataFrame()
