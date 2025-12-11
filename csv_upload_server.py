@@ -108,7 +108,7 @@ class PasteUploadHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"Not found")
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/upload", "/upload/"):
+        if self.path not in ("/", "/upload", "/upload/"):
             self.send_response(404)
             self.end_headers()
             return
