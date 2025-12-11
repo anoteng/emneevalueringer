@@ -14,7 +14,7 @@ import http.server
 import socketserver
 from urllib.parse import parse_qs
 
-import evaluation_db_mysql  # sørg for at denne ligger i samme katalog / på PYTHONPATH
+import evaluation_db_mysql
 
 
 class PasteUploadHandler(http.server.BaseHTTPRequestHandler):
@@ -76,7 +76,7 @@ class PasteUploadHandler(http.server.BaseHTTPRequestHandler):
   <h2>Importer emneevaluering</h2>
   <p>Kopier tabellen fra Excel (inkludert header) og lim inn i feltet under.</p>
   {"<p class='msg'>" + message + "</p>" if message else ""}
-  <form method="post" action="/upload">
+  <form method="post" action="">
     <label for="year">År:</label>
     <input type="number" id="year" name="year" min="1900" max="2100" value="2025" required>
 
