@@ -24,7 +24,7 @@ from typing import Iterable, Optional
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-
+from urllib.parse import quote_plus
 
 # ---------------------------------------------------------------------------
 # DB-tilkobling
