@@ -30,6 +30,17 @@ from urllib.parse import quote_plus
 # ---------------------------------------------------------------------------
 # DB-tilkobling
 # ---------------------------------------------------------------------------
+def _norm_label(label: str) -> str:
+    """Litt forsiktig normalisering av label for matching."""
+    if label is None:
+        return ""
+    s = label.strip().lower()
+    # fjern noen vanlige skilletegn på slutten
+    while s and s[-1] in ".!?:":
+        s = s[:-1]
+    # slå sammen whitespace
+    parts = s.split()
+    return " ".join(parts)
 
 
 def _get_engine(db_name: str):
@@ -467,43 +478,78 @@ def import_pasted_evaluations(
                 + ", ".join(missing)
             )
 
-        # 2) Eksisterende spørsmål
+        # 2) Eksisterende spørsmål – tillater flere rader med samme code,
+        # men prøver å gjenbruke "samme" spørsmål (lik label) om mulig.
         res_q = conn.execute(
             text(
                 "SELECT id, code, label, display_order "
                 "FROM course_eval_question"
             )
         )
-        existing = {r._mapping["code"]: r._mapping for r in res_q}
-        if existing:
+        existing_rows = [dict(r._mapping) for r in res_q]
+
+        if existing_rows:
             next_display_order = max(
-                (row["display_order"] or 0) for row in existing.values()
+                (row["display_order"] or 0) for row in existing_rows
             ) + 1
         else:
             next_display_order = 1
 
+        # Bygg opp to hjelpekart:
+        #  - (code, norm_label) -> id  (eksakt match på både kode og "lik" tekst)
+        #  - code -> liste av rader (om du senere vil gjøre mer fuzzy matching)
+        existing_by_code_and_label: dict[tuple[str, str], int] = {}
+        existing_by_code: dict[str, list[dict]] = {}
+
+        for row in existing_rows:
+            code = row["code"]
+            label = row.get("label") or ""
+            norm = _norm_label(label)
+            existing_by_code_and_label[(code, norm)] = row["id"]
+            existing_by_code.setdefault(code, []).append(row)
+
         code_to_question_id: dict[str, int] = {}
 
-        # Sørg for at alle spørsmål i header finnes
+        # Sørg for at alle spørsmål i header finnes.
+        # Strategi:
+        #  1) Finn eksisterende rad med samme code + "samme" label -> gjenbruk
+        #  2) Hvis ikke: opprett NY rad med samme code, ny label
         for code, label in question_defs:
-            if code in existing:
-                code_to_question_id[code] = existing[code]["id"]
-            else:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO course_eval_question (code, label, display_order)
-                        VALUES (:code, :label, :display_order)
-                        """
-                    ),
-                    {"code": code, "label": label, "display_order": next_display_order},
-                )
-                # LAST_INSERT_ID() er connection-spesifikt
-                qid = conn.execute(
-                    text("SELECT LAST_INSERT_ID()")
-                ).scalar_one()
-                code_to_question_id[code] = int(qid)
-                next_display_order += 1
+            norm_label = _norm_label(label)
+            key = (code, norm_label)
+
+            if key in existing_by_code_and_label:
+                # samme kode og (nesten) samme tekst -> bruk eksisterende id
+                qid = existing_by_code_and_label[key]
+                code_to_question_id[code] = qid
+                continue
+
+            # Ingen match på (code, label) -> opprett NYTT spørsmål
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO course_eval_question (code, label, display_order)
+                    VALUES (:code, :label, :display_order)
+                    """
+                ),
+                {"code": code, "label": label, "display_order": next_display_order},
+            )
+            qid = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar_one()
+            qid = int(qid)
+
+            # Oppdater kartene slik at senere imports kan gjenbruke dette
+            existing_by_code_and_label[key] = qid
+            existing_by_code.setdefault(code, []).append(
+                {
+                    "id": qid,
+                    "code": code,
+                    "label": label,
+                    "display_order": next_display_order,
+                }
+            )
+
+            code_to_question_id[code] = qid
+            next_display_order += 1
 
         inserted_evals = 0
 
