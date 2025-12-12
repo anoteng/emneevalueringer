@@ -27,10 +27,10 @@ import argparse
 import json
 import logging
 import sys
+import numpy as np
+import pandas as pd
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
-
-import pandas as pd
 
 try:
     # MariaDB-variant av evaluation_db
@@ -181,8 +181,15 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                         )
                     df = df[cols_to_keep]
                 if fmt == "json":
-                    # Bytt ut NaN/NaT med None → JSON får null i stedet for NaN
-                    df_safe = df.where(pd.notnull(df), None)
+                    # Gjør df "JSON-safe": sørg for at NaN/NaT/Inf blir None
+                    df_safe = df.copy()
+
+                    # 1) Konverter til object så pandas lar oss putte inn None
+                    df_safe = df_safe.astype(object)
+
+                    # 2) Erstatt problemverdier
+                    df_safe = df_safe.where(pd.notnull(df_safe), None)
+                    df_safe = df_safe.replace({np.nan: None, np.inf: None, -np.inf: None})
 
                     result_json = df_safe.to_dict(orient="records")
                     payload = json.dumps(result_json, ensure_ascii=False, allow_nan=False)
