@@ -185,7 +185,7 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                     df_safe = df.where(pd.notnull(df), None)
 
                     result_json = df_safe.to_dict(orient="records")
-                    payload = json.dumps(result_json, ensure_ascii=False)
+                    payload = json.dumps(result_json, ensure_ascii=False, allow_nan=False)
 
                     self._set_headers(200, "application/json; charset=utf-8")
                     self.wfile.write(payload.encode("utf-8"))
