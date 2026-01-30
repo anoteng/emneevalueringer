@@ -640,3 +640,301 @@ def import_pasted_evaluations(
         run,
     )
     return inserted_evals
+
+
+# ---------------------------------------------------------------------------
+# Studieprogrammer – brukes av /api/programmes og /api/programme/<code>/courses
+# ---------------------------------------------------------------------------
+
+
+def get_programmes(db_path: str) -> list[dict]:
+    """
+    Returner en liste med studieprogrammer som har minst ett emne i programme_course.
+
+    Hver entry har:
+      - code: programkode (study_programme.programme_code)
+      - name: norsk navn
+      - course_count: antall emner i programmet
+      - semesters: liste med tilgjengelige sekvensielle semestre (1, 2, 3, ...)
+    """
+    engine = _get_engine(db_path)
+
+    # Hent programmer med antall emner
+    sql_programmes = """
+        SELECT
+          sp.programme_code AS code,
+          sp.name_no AS name,
+          COUNT(DISTINCT pc.course_id) AS course_count
+        FROM study_programme sp
+        JOIN programme_course pc ON pc.programme_id = sp.id
+        GROUP BY sp.id, sp.programme_code, sp.name_no
+        HAVING course_count > 0
+        ORDER BY sp.programme_code
+    """
+    df_programmes = pd.read_sql(text(sql_programmes), engine)
+
+    if df_programmes.empty:
+        return []
+
+    # Hent tilgjengelige sekvensielle semestre per program
+    sql_semesters = """
+        SELECT DISTINCT
+          sp.programme_code AS code,
+          pc.semester AS semester_num
+        FROM study_programme sp
+        JOIN programme_course pc ON pc.programme_id = sp.id
+        ORDER BY sp.programme_code, pc.semester
+    """
+    df_semesters = pd.read_sql(text(sql_semesters), engine)
+
+    # Bygg opp resultatet
+    result: list[dict] = []
+    for _, row in df_programmes.iterrows():
+        code = row["code"]
+        semesters_for_prog = df_semesters[df_semesters["code"] == code]
+        semesters_list = [int(s) for s in semesters_for_prog["semester_num"].tolist()]
+        result.append({
+            "code": code,
+            "name": row["name"],
+            "course_count": int(row["course_count"]),
+            "semesters": semesters_list,
+        })
+
+    return result
+
+
+def get_programme_courses(
+    db_path: str,
+    programme_code: str,
+    semester: Optional[int] = None,
+    semesters: Optional[list[int]] = None,
+) -> list[dict]:
+    """
+    Returner emneliste for et studieprogram.
+
+    Valgfri filtrering på sekvensielt semester (1-6) eller liste av semestre.
+
+    Hver entry har:
+      - course_code: emnekode
+      - course_name: emnenavn
+      - semester: sekvensielt semester (1, 2, 3, ...)
+    """
+    engine = _get_engine(db_path)
+
+    sql = """
+        SELECT
+          c.course_code,
+          COALESCE(c.name_no, c.name_eng, c.course_code) AS course_name,
+          pc.semester
+        FROM programme_course pc
+        JOIN courses c ON c.id = pc.course_id
+        JOIN study_programme sp ON sp.id = pc.programme_id
+        WHERE sp.programme_code = :programme_code
+    """
+    params: dict = {"programme_code": programme_code}
+
+    if semester is not None:
+        sql += " AND pc.semester = :semester"
+        params["semester"] = semester
+    elif semesters is not None and len(semesters) > 0:
+        placeholders = ", ".join(f":sem{i}" for i in range(len(semesters)))
+        sql += f" AND pc.semester IN ({placeholders})"
+        for i, sem in enumerate(semesters):
+            params[f"sem{i}"] = sem
+
+    sql += " ORDER BY pc.semester, c.course_code"
+
+    df = pd.read_sql(text(sql), engine, params=params)
+
+    if df.empty:
+        return []
+
+    result: list[dict] = []
+    for _, row in df.iterrows():
+        result.append({
+            "course_code": row["course_code"],
+            "course_name": row["course_name"],
+            "semester": int(row["semester"]),
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# PowerPoint-eksport for studieprogram
+# ---------------------------------------------------------------------------
+
+
+def generate_programme_pptx(
+    db_path: str,
+    programme_code: str,
+    programme_name: str | None = None,
+    semester: Optional[int] = None,
+    semesters: Optional[list[int]] = None,
+) -> bytes:
+    """
+    Generer en PowerPoint-presentasjon med emneevalueringer for et studieprogram.
+
+    Returnerer PPTX-filen som bytes.
+
+    - Tittelslide med programnavn
+    - Én slide per emne med native bar chart (spørsmålsscorer per år/termin)
+    """
+    from io import BytesIO
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+
+    courses = get_programme_courses(
+        db_path, programme_code, semester=semester, semesters=semesters
+    )
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    # --- Tittelslide ---
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title_slide.shapes.title.text = programme_name or programme_code
+
+    # Bygg undertittel med utvalg
+    subtitle_parts = ["Emneevalueringer"]
+    if semester is not None:
+        subtitle_parts.append(f"{semester}. semester")
+    elif semesters is not None and len(semesters) > 0:
+        odd = all(s % 2 == 1 for s in semesters)
+        even = all(s % 2 == 0 for s in semesters)
+        if odd:
+            subtitle_parts.append(f"Alle høstemner ({', '.join(str(s) + '.' for s in sorted(semesters))} sem.)")
+        elif even:
+            subtitle_parts.append(f"Alle våremner ({', '.join(str(s) + '.' for s in sorted(semesters))} sem.)")
+        else:
+            subtitle_parts.append(f"{', '.join(str(s) + '.' for s in sorted(semesters))} semester")
+
+    if title_slide.placeholders[1]:
+        title_slide.placeholders[1].text = " – ".join(subtitle_parts)
+
+    COLORS = [
+        RGBColor(0x40, 0x9A, 0x28),  # grønn
+        RGBColor(0x26, 0x6E, 0xCC),  # blå
+        RGBColor(0xCC, 0x6E, 0x26),  # oransje
+        RGBColor(0xCC, 0x26, 0x6E),  # rosa
+        RGBColor(0x6E, 0x26, 0xCC),  # lilla
+        RGBColor(0x26, 0xCC, 0x6E),  # turkis
+        RGBColor(0xCC, 0xCC, 0x26),  # gul
+        RGBColor(0x26, 0xCC, 0xCC),  # cyan
+    ]
+
+    META_COLS = {
+        "År", "Antall svar", "Antall invitert", "Svar%",
+        "Term", "Semester", "Termin", "semester_rank", "Gjennomføring", "run",
+    }
+
+    for course in courses:
+        code = course["course_code"]
+        name = course["course_name"]
+
+        df = get_subject_overview_df(db_path, code, include_stats=True)
+        if df.empty:
+            continue
+
+        # Sorter rader
+        sort_cols = [c for c in ["År", "semester_rank", "run"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(by=sort_cols)
+
+        # Finn spørsmålskolonner
+        question_cols = [
+            c for c in df.columns
+            if c not in META_COLS
+            and df[c].apply(lambda v: isinstance(v, (int, float))).any()
+        ]
+
+        if not question_cols:
+            continue
+
+        # Bygg labels for serier (år + termin + svarprosent)
+        series_labels = []
+        for _, row in df.iterrows():
+            label = f"{int(row['År'])} {row.get('Termin', '')}".strip()
+            svar_pct = row.get("Svar%")
+            if svar_pct is not None:
+                if isinstance(svar_pct, (int, float)):
+                    label += f" ({svar_pct:.0f}%)"
+                else:
+                    pct_str = str(svar_pct).replace("%", "").strip()
+                    label += f" ({pct_str}%)"
+            series_labels.append(label)
+
+        # Bygg chart data
+        chart_data = CategoryChartData()
+        chart_data.categories = question_cols
+
+        for idx, (_, row) in enumerate(df.iterrows()):
+            values = []
+            for col in question_cols:
+                v = row.get(col)
+                if isinstance(v, (int, float)) and not pd.isna(v):
+                    values.append(round(v, 2))
+                else:
+                    values.append(None)
+            chart_data.add_series(series_labels[idx], values)
+
+        # Lag slide
+        slide = prs.slides.add_slide(prs.slide_layouts[5])  # Blank layout
+
+        # Bruk tittel-placeholder hvis den finnes, ellers legg til tekstboks
+        title_shape = None
+        for shape in slide.placeholders:
+            if shape.placeholder_format.idx == 0:
+                title_shape = shape
+                break
+
+        if title_shape is not None:
+            title_shape.text = f"{code} – {name}"
+            title_shape.text_frame.paragraphs[0].font.size = Pt(24)
+            title_shape.text_frame.paragraphs[0].font.bold = True
+        else:
+            txBox = slide.shapes.add_textbox(
+                Inches(0.5), Inches(0.3), Inches(12), Inches(0.6)
+            )
+            tf = txBox.text_frame
+            p = tf.paragraphs[0]
+            p.text = f"{code} – {name}"
+            p.font.size = Pt(24)
+            p.font.bold = True
+
+        # Chart
+        chart_shape = slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED,
+            Inches(0.5), Inches(1.1),
+            Inches(12.3), Inches(5.8),
+            chart_data,
+        )
+
+        chart = chart_shape.chart
+        chart.has_legend = True
+        chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+        chart.legend.include_in_layout = False
+        chart.legend.font.size = Pt(9)
+
+        # Y-akse: 0–6
+        value_axis = chart.value_axis
+        value_axis.minimum_scale = 0
+        value_axis.maximum_scale = 6
+        value_axis.major_unit = 1
+        value_axis.has_title = True
+        value_axis.axis_title.text_frame.paragraphs[0].text = "Score"
+        value_axis.axis_title.text_frame.paragraphs[0].font.size = Pt(10)
+
+        # Farger på serier
+        for i, series in enumerate(chart.series):
+            series.format.fill.solid()
+            series.format.fill.fore_color.rgb = COLORS[i % len(COLORS)]
+
+    # Skriv til bytes
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()

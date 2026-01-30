@@ -34,7 +34,14 @@ from urllib.parse import parse_qs, urlparse
 
 try:
     # MariaDB-variant av evaluation_db
-    from evaluation_db_mysql import get_subject_overview_df, get_subjects_df, get_subjects
+    from evaluation_db_mysql import (
+        get_subject_overview_df,
+        get_subjects_df,
+        get_subjects,
+        get_programmes,
+        get_programme_courses,
+        generate_programme_pptx,
+    )
 except Exception as exc:  # pragma: no cover - just informative logging
     logging.getLogger(__name__).warning(
         "Unable to import evaluation_db: %s. API will not function.", exc
@@ -229,6 +236,135 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                     self._set_headers(200, "text/html; charset=utf-8")
                     self.wfile.write(page.encode("utf-8"))
                     return
+        # Handle listing all programmes: /api/programmes
+        if path in {"/api/programmes", "/api/programmes/"}:
+            try:
+                programmes = get_programmes(self.server.db_path)
+            except Exception as exc:
+                logging.getLogger(__name__).exception(
+                    "Error retrieving programmes: %s", exc
+                )
+                self._set_headers(500, "text/plain; charset=utf-8")
+                self.wfile.write(f"Error retrieving programmes: {exc}".encode("utf-8"))
+                return
+            payload = json.dumps({"items": programmes}, ensure_ascii=False)
+            self._set_headers(200, "application/json; charset=utf-8")
+            self.wfile.write(payload.encode("utf-8"))
+            return
+
+        # Handle /api/programme/<code>/courses
+        if path.startswith("/api/programme/") and "/courses" in path:
+            parts = path.strip("/").split("/")
+            # Expect: ['api', 'programme', '<code>', 'courses']
+            if len(parts) >= 4 and parts[3] == "courses":
+                programme_code = parts[2]
+                semester_param = query_params.get("semester", [None])[0]
+                semesters_param = query_params.get("semesters", [None])[0]
+
+                semester: int | None = None
+                semesters: list[int] | None = None
+
+                if semester_param:
+                    try:
+                        semester = int(semester_param)
+                    except ValueError:
+                        pass
+
+                if semesters_param:
+                    try:
+                        semesters = [int(s.strip()) for s in semesters_param.split(",") if s.strip()]
+                    except ValueError:
+                        pass
+
+                try:
+                    courses = get_programme_courses(
+                        self.server.db_path,
+                        programme_code,
+                        semester=semester,
+                        semesters=semesters,
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).exception(
+                        "Error retrieving courses for %s: %s", programme_code, exc
+                    )
+                    self._set_headers(500, "text/plain; charset=utf-8")
+                    self.wfile.write(
+                        f"Error retrieving courses for {programme_code}: {exc}".encode("utf-8")
+                    )
+                    return
+
+                payload = json.dumps({"items": courses}, ensure_ascii=False)
+                self._set_headers(200, "application/json; charset=utf-8")
+                self.wfile.write(payload.encode("utf-8"))
+                return
+
+        # Handle /api/programme/<code>/export/pptx
+        if path.startswith("/api/programme/") and "/export/pptx" in path:
+            parts = path.strip("/").split("/")
+            # Expect: ['api', 'programme', '<code>', 'export', 'pptx']
+            if len(parts) >= 5 and parts[3] == "export" and parts[4] == "pptx":
+                programme_code = parts[2]
+                semester_param = query_params.get("semester", [None])[0]
+                semesters_param = query_params.get("semesters", [None])[0]
+
+                semester: int | None = None
+                semesters: list[int] | None = None
+
+                if semester_param:
+                    try:
+                        semester = int(semester_param)
+                    except ValueError:
+                        pass
+
+                if semesters_param:
+                    try:
+                        semesters = [int(s.strip()) for s in semesters_param.split(",") if s.strip()]
+                    except ValueError:
+                        pass
+
+                # Hent programnavn for tittelslide
+                programme_name = programme_code
+                try:
+                    progs = get_programmes(self.server.db_path)
+                    match = [p for p in progs if p["code"] == programme_code]
+                    if match:
+                        programme_name = match[0]["name"]
+                except Exception:
+                    pass
+
+                try:
+                    pptx_bytes = generate_programme_pptx(
+                        self.server.db_path,
+                        programme_code,
+                        programme_name=programme_name,
+                        semester=semester,
+                        semesters=semesters,
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).exception(
+                        "Error generating PPTX for %s: %s", programme_code, exc
+                    )
+                    self._set_headers(500, "text/plain; charset=utf-8")
+                    self.wfile.write(
+                        f"Error generating PPTX for {programme_code}: {exc}".encode("utf-8")
+                    )
+                    return
+
+                filename = f"{programme_code}_evalueringer.pptx"
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{filename}"',
+                )
+                self.send_header("Content-Length", str(len(pptx_bytes)))
+                self.end_headers()
+                self.wfile.write(pptx_bytes)
+                return
+
         # If path doesn't match, return 404
         self._set_headers(404, "text/plain; charset=utf-8")
         self.wfile.write(b"Not Found")
