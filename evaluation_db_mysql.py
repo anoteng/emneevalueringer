@@ -180,7 +180,7 @@ def get_subject_overview_df(
         SELECT
             e.year              AS year,
             s.name              AS term_name,
-            s.rank              AS semester_rank,
+            s.calendar_rank     AS semester_rank,
             e.run               AS run,
             q.code              AS question_code,
             q.label             AS question_label,
@@ -246,7 +246,7 @@ def get_subject_overview_df(
             SELECT
                 e.year              AS year,
                 s.name              AS term_name,
-                s.rank              AS semester_rank,
+                s.calendar_rank     AS semester_rank,
                 e.run               AS run,
                 st.answered         AS answered,
                 st.invited          AS invited,
@@ -553,7 +553,45 @@ def import_pasted_evaluations(
 
         inserted_evals = 0
 
-        # 3) Importer rad for rad
+        # 3) Slett eksisterende evalueringer for samme (course_id, year, semester_id, run)
+        #    slik at re-opplasting overskriver i stedet for å lage duplikater.
+        for course_code_val in sorted(course_codes):
+            cid = code_to_course_id[course_code_val]
+            existing = conn.execute(
+                text(
+                    "SELECT id FROM course_eval "
+                    "WHERE course_id = :course_id AND year = :year "
+                    "AND semester_id = :semester_id AND run = :run"
+                ),
+                {
+                    "course_id": cid,
+                    "year": year,
+                    "semester_id": semester_id,
+                    "run": run,
+                },
+            )
+            existing_ids = [row._mapping["id"] for row in existing]
+            if existing_ids:
+                ph = ", ".join(f":eid{i}" for i in range(len(existing_ids)))
+                eid_params = {f"eid{i}": eid for i, eid in enumerate(existing_ids)}
+                conn.execute(
+                    text(f"DELETE FROM course_eval_result WHERE evaluation_id IN ({ph})"),
+                    eid_params,
+                )
+                conn.execute(
+                    text(f"DELETE FROM course_eval_stats WHERE evaluation_id IN ({ph})"),
+                    eid_params,
+                )
+                conn.execute(
+                    text(f"DELETE FROM course_eval WHERE id IN ({ph})"),
+                    eid_params,
+                )
+                logger.info(
+                    "Slettet %s eksisterende evaluering(er) for %s year=%s semester_id=%s run=%s",
+                    len(existing_ids), course_code_val, year, semester_id, run,
+                )
+
+        # 4) Importer rad for rad
         for cells in data_rows:
             course_code = cells[0]
             course_id = code_to_course_id[course_code]

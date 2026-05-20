@@ -30,7 +30,7 @@ import sys
 import numpy as np
 import pandas as pd
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     # MariaDB-variant av evaluation_db
@@ -41,11 +41,21 @@ try:
         get_programmes,
         get_programme_courses,
         generate_programme_pptx,
+        get_semesters,
+        import_pasted_evaluations,
     )
 except Exception as exc:  # pragma: no cover - just informative logging
     logging.getLogger(__name__).warning(
         "Unable to import evaluation_db: %s. API will not function.", exc
     )
+
+from auth import (
+    verify_session,
+    has_eval_access,
+    login_user,
+    logout_user,
+    parse_cookie_token,
+)
 
 
 def _parse_bool(value: str, default: bool) -> bool:
@@ -67,17 +77,262 @@ def _parse_bool(value: str, default: bool) -> bool:
 class EvaluationRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the evaluation API."""
 
+    @property
+    def _prefix(self) -> str:
+        """URL-prefiks fra X-Script-Name header (satt av nginx), f.eks. '/emneevalueringer'."""
+        return (self.headers.get("X-Script-Name") or "").rstrip("/")
+
     def _set_headers(self, status: int, content_type: str) -> None:
         """Send a response status and headers."""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.end_headers()
 
+    # ------------------------------------------------------------------
+    # Autentisering
+    # ------------------------------------------------------------------
+
+    def _get_authenticated_user(self) -> dict | None:
+        """Returnerer brukerinfo hvis gyldig sesjon med emneevaluering-tilgang."""
+        cookie_header = self.headers.get("Cookie")
+        token = parse_cookie_token(cookie_header)
+        if not token:
+            return None
+        user = verify_session(self.server.db_path, token)
+        if not user:
+            return None
+        if not has_eval_access(self.server.db_path, user["uuid"]):
+            return None
+        return user
+
+    def _require_auth(self) -> dict | None:
+        """Sjekk auth; redirect til /login hvis ikke innlogget. Returnerer bruker eller None."""
+        user = self._get_authenticated_user()
+        if not user:
+            self.send_response(302)
+            self.send_header("Location", f"{self._prefix}/login")
+            self.end_headers()
+            return None
+        return user
+
+    # ------------------------------------------------------------------
+    # Login-side
+    # ------------------------------------------------------------------
+
+    def _serve_login_page(self, message: str = "") -> None:
+        msg_html = f'<p class="msg">{message}</p>' if message else ""
+        html = f"""<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="utf-8">
+  <title>Logg inn – Emneevalueringer</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2em; max-width: 400px; margin-left: auto; margin-right: auto; }}
+    label {{ display: block; margin-top: 1em; font-weight: bold; }}
+    input[type=email], input[type=password] {{ width: 100%; padding: 0.5em; margin-top: 0.3em; box-sizing: border-box; }}
+    button {{ margin-top: 1.5em; padding: 0.6em 1.5em; }}
+    .msg {{ color: #900; }}
+  </style>
+</head>
+<body>
+  <h2>Logg inn</h2>
+  <p>Bruk din AACSB/AOL-konto.</p>
+  {msg_html}
+  <form method="post" action="{self._prefix}/login">
+    <label for="email">E-post:</label>
+    <input type="email" id="email" name="email" required autofocus>
+    <label for="password">Passord:</label>
+    <input type="password" id="password" name="password" required>
+    <button type="submit">Logg inn</button>
+  </form>
+</body>
+</html>"""
+        self._set_headers(200, "text/html; charset=utf-8")
+        self.wfile.write(html.encode("utf-8"))
+
+    def _handle_login(self) -> None:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        form = parse_qs(body)
+
+        email = (form.get("email") or [""])[0].strip()
+        password = (form.get("password") or [""])[0]
+
+        if not email or not password:
+            self._serve_login_page(message="Fyll inn e-post og passord.")
+            return
+
+        ip = self.headers.get("X-Real-IP") or (self.client_address[0] if self.client_address else None)
+        ua = self.headers.get("User-Agent")
+
+        token = login_user(self.server.db_path, email, password, ip_address=ip, user_agent=ua)
+        if not token:
+            self._serve_login_page(message="Feil e-post eller passord.")
+            return
+
+        # Sjekk at brukeren faktisk har emneevaluering-tilgang
+        user = verify_session(self.server.db_path, token)
+        if not user or not has_eval_access(self.server.db_path, user["uuid"]):
+            logout_user(self.server.db_path, token)
+            self._serve_login_page(message="Kontoen din har ikke tilgang til emneevalueringer.")
+            return
+
+        self.send_response(302)
+        self.send_header(
+            "Set-Cookie",
+            f"session_token={token}; HttpOnly; Secure; SameSite=Lax; Max-Age=604800; Path=/",
+        )
+        self.send_header("Location", f"{self._prefix}/upload")
+        self.end_headers()
+
+    def _handle_logout(self) -> None:
+        cookie_header = self.headers.get("Cookie")
+        token = parse_cookie_token(cookie_header)
+        if token:
+            logout_user(self.server.db_path, token)
+        self.send_response(302)
+        self.send_header(
+            "Set-Cookie",
+            "session_token=; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Path=/",
+        )
+        self.send_header("Location", f"{self._prefix}/login")
+        self.end_headers()
+
+    # ------------------------------------------------------------------
+    # Upload-side
+    # ------------------------------------------------------------------
+
+    def _serve_upload_form(self, user: dict, message: str = "") -> None:
+        try:
+            semesters = get_semesters(self.server.db_path)
+        except Exception as exc:
+            semesters = []
+            message = (message + "<br>" if message else "") + f"Feil ved henting av semester-liste: {exc}"
+
+        options_html = ""
+        for sem in semesters:
+            options_html += f"<option value='{sem['id']}'>{sem['name']}</option>"
+
+        msg_html = f'<p class="msg">{message}</p>' if message else ""
+        name = f"{user['firstname']} {user['lastname']}"
+
+        html = f"""<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="utf-8">
+  <title>Importer emneevalueringer</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2em; max-width: 900px; }}
+    textarea {{ width: 100%; font-family: monospace; }}
+    label {{ display: block; margin-top: 1em; font-weight: bold; }}
+    input[type=number], select {{ padding: 0.3em; margin-top: 0.2em; }}
+    button {{ margin-top: 1em; padding: 0.5em 1.2em; }}
+    .msg {{ margin-bottom: 1em; color: #900; }}
+    .topbar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1em; border-bottom: 1px solid #ccc; padding-bottom: 0.5em; }}
+    .topbar form {{ margin: 0; }}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span>Innlogget som <strong>{name}</strong></span>
+    <form method="post" action="{self._prefix}/logout"><button type="submit">Logg ut</button></form>
+  </div>
+  <h2>Importer emneevaluering</h2>
+  <p>Kopier tabellen fra Excel (inkludert header) og lim inn i feltet under.
+     Eksisterende data for samme emne/&aring;r/semester/run blir overskrevet.</p>
+  {msg_html}
+  <form method="post" action="{self._prefix}/upload">
+    <label for="year">&Aring;r:</label>
+    <input type="number" id="year" name="year" min="1900" max="2100" value="2025" required>
+
+    <label for="semester_id">Semester:</label>
+    <select id="semester_id" name="semester_id" required>
+      {options_html}
+    </select>
+
+    <label for="run">Run (l&oslash;penummer, 1 hvis kun &eacute;n gjennomf&oslash;ring):</label>
+    <input type="number" id="run" name="run" value="1" min="1">
+
+    <label for="data">Data (limt inn fra Excel):</label>
+    <textarea id="data" name="data" rows="25"></textarea>
+
+    <button type="submit">Importer</button>
+  </form>
+</body>
+</html>"""
+        self._set_headers(200, "text/html; charset=utf-8")
+        self.wfile.write(html.encode("utf-8"))
+
+    def _handle_upload(self, user: dict) -> None:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        form = parse_qs(body)
+
+        def _get(name, default=None):
+            values = form.get(name)
+            return values[0] if values else default
+
+        year_raw = _get("year")
+        semester_raw = _get("semester_id")
+        run_raw = _get("run", "1")
+        data = _get("data", "")
+
+        if not (year_raw and semester_raw and data.strip()):
+            self._serve_upload_form(user, message="Alle felter (år, semester, data) må fylles ut.")
+            return
+
+        try:
+            year = int(year_raw)
+            semester_id = int(semester_raw)
+            run = int(run_raw or "1")
+        except ValueError:
+            self._serve_upload_form(user, message="År, semester og run må være heltall.")
+            return
+
+        try:
+            inserted = import_pasted_evaluations(
+                self.server.db_path,
+                year=year,
+                semester_id=semester_id,
+                run=run,
+                tsv_text=data,
+            )
+            message = f"Import fullført: opprettet {inserted} evaluering(er) for år {year}, semester_id={semester_id}, run={run}."
+            logging.getLogger(__name__).info(message)
+            self._serve_upload_form(user, message=message)
+        except Exception as exc:
+            msg = f"Import feilet: {exc}"
+            logging.getLogger(__name__).error(msg)
+            self._serve_upload_form(user, message=msg)
+
+    # ------------------------------------------------------------------
+    # Request routing
+    # ------------------------------------------------------------------
+
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         """Handle a GET request."""
         parsed_url = urlparse(self.path)
-        path = parsed_url.path
+        path = unquote(parsed_url.path)
         query_params = parse_qs(parsed_url.query)
+
+        # Login-side
+        if path in {"/login", "/login/"}:
+            # Allerede innlogget? Redirect til upload.
+            if self._get_authenticated_user():
+                self.send_response(302)
+                self.send_header("Location", f"{self._prefix}/upload")
+                self.end_headers()
+                return
+            self._serve_login_page()
+            return
+
+        # Upload-side (krever innlogging)
+        if path in {"/upload", "/upload/"}:
+            user = self._require_auth()
+            if not user:
+                return
+            self._serve_upload_form(user)
+            return
 
         # Handle listing all subjects.  This endpoint supports optional
         # search (``q``) and limit (``limit``) parameters to filter and
@@ -366,6 +621,29 @@ class EvaluationRequestHandler(BaseHTTPRequestHandler):
                 return
 
         # If path doesn't match, return 404
+        self._set_headers(404, "text/plain; charset=utf-8")
+        self.wfile.write(b"Not Found")
+
+    def do_POST(self) -> None:  # noqa: N802
+        """Handle a POST request."""
+        parsed_url = urlparse(self.path)
+        path = unquote(parsed_url.path)
+
+        if path in {"/login", "/login/"}:
+            self._handle_login()
+            return
+
+        if path in {"/logout", "/logout/"}:
+            self._handle_logout()
+            return
+
+        if path in {"/upload", "/upload/"}:
+            user = self._require_auth()
+            if not user:
+                return
+            self._handle_upload(user)
+            return
+
         self._set_headers(404, "text/plain; charset=utf-8")
         self.wfile.write(b"Not Found")
 
